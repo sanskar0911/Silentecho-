@@ -1,0 +1,451 @@
+from flask import Flask, render_template, Response, jsonify, request, session
+import cv2
+import mediapipe as mp
+import os
+import csv
+import subprocess
+import time
+import sqlite3
+from werkzeug.security import generate_password_hash, check_password_hash
+from ultralytics import YOLO
+
+from gesture_recognition import load_and_train_model, predict_gesture
+
+app = Flask(__name__)
+app.secret_key = "secret"
+
+# =====================
+# SQLITE AUTH
+# =====================
+def init_db():
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE,
+        password TEXT
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+init_db()
+
+
+@app.route("/register", methods=["POST"])
+def register():
+    data = request.get_json()
+    email = data["email"]
+    password = generate_password_hash(data["password"])
+
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+
+    try:
+        c.execute("INSERT INTO users(email,password) VALUES (?,?)",(email,password))
+        conn.commit()
+    except:
+        return jsonify({"status":"exists"})
+
+    conn.close()
+    return jsonify({"status":"ok"})
+
+
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.get_json()
+
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+
+    c.execute("SELECT * FROM users WHERE email=?",(data["email"],))
+    user = c.fetchone()
+
+    conn.close()
+
+    if user and check_password_hash(user[2],data["password"]):
+        session["user"]=data["email"]
+        return jsonify({"status":"ok"})
+
+    return jsonify({"status":"fail"})
+
+
+# =====================
+# LOAD MODELS
+# =====================
+asl_model, current_accuracy = load_and_train_model()
+isl_model,_ = load_and_train_model("isl_gesture_data.csv")
+
+try:
+    yolo_model = YOLO("runs/classify/train3/weights/best.pt")
+except:
+    try:
+        yolo_model = YOLO("best.pt")
+    except:
+        print("WARNING: YOLO model not found")
+        yolo_model = None
+
+# =====================
+# MEDIAPIPE
+# =====================
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    max_num_hands=2,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7,
+)
+
+mp_draw = mp.solutions.drawing_utils
+
+
+# =====================
+# GLOBAL STATE
+# =====================
+camera=None
+latest_prediction=""
+latest_confidence=0   # NEW
+last_prediction=None
+last_spoken=0
+speak_enabled=True
+current_inference_mode="auto"
+
+word_mode=False
+word_buffer=[]
+last_added_letter=None
+
+# NEW FEATURES
+sentence_buffer=[]
+conversation_history=[]
+language="en"
+
+
+# =====================
+# VIDEO STREAM
+# =====================
+def gen_frames():
+
+    global camera,latest_prediction,last_prediction,last_spoken,latest_confidence
+    global word_mode,word_buffer,last_added_letter,current_inference_mode,yolo_model
+
+    if camera is None or not camera.isOpened():
+        camera=cv2.VideoCapture(0)
+        time.sleep(0.5)
+
+    while True:
+
+        success,frame=camera.read()
+        if not success:
+            continue
+
+        frame=cv2.flip(frame,1)
+        rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
+
+        prediction=""
+        confidence=0
+        yolo_pred=None
+        yolo_conf=0
+        use_mediapipe=False
+        
+        if current_inference_mode in ["yolo", "auto"] and yolo_model:
+            results = yolo_model.predict(frame, imgsz=160, verbose=False)
+            if len(results) > 0:
+                probs = results[0].probs
+                if probs is not None:
+                    # Filter out non-alphabet classes (like folder names) by checking top5
+                    for idx in probs.top5:
+                        class_name = results[0].names[int(idx)]
+                        if len(class_name) == 1 and class_name.isalpha():
+                            yolo_pred = class_name
+                            yolo_conf = float(probs.data[int(idx)]) * 100.0
+                            break
+            
+            if yolo_pred and (current_inference_mode == "yolo" or (current_inference_mode == "auto" and yolo_conf >= 60.0)):
+                prediction = yolo_pred
+                confidence = round(yolo_conf, 2)
+            else:
+                use_mediapipe = True
+        else:
+            use_mediapipe = True
+
+        if use_mediapipe:
+            result=hands.process(rgb)
+            asl_pred=None
+            isl_pred=None
+
+            if result.multi_hand_landmarks:
+
+                num_hands=len(result.multi_hand_landmarks)
+
+                cv2.putText(frame,f"Hands: {num_hands}",(10,100),
+                cv2.FONT_HERSHEY_SIMPLEX,0.8,(255,255,0),2)
+
+                for hand_landmarks in result.multi_hand_landmarks:
+                    mp_draw.draw_landmarks(
+                        frame,
+                        hand_landmarks,
+                        mp_hands.HAND_CONNECTIONS
+                    )
+
+                # ASL
+                h=result.multi_hand_landmarks[0]
+                x=[lm.x for lm in h.landmark]
+                y=[lm.y for lm in h.landmark]
+                bx=x[0];by=y[0]
+                land=[(v-bx) for v in x]+[(v-by) for v in y]
+
+                if asl_model:
+                    probs = asl_model.predict_proba([land])[0]
+                    max_index = probs.argmax()
+                    asl_pred = asl_model.classes_[max_index]
+                    confidence = round(probs[max_index]*100,2)
+
+                # ISL
+                if num_hands==2:
+
+                    def norm(h):
+                        x=[lm.x for lm in h.landmark]
+                        y=[lm.y for lm in h.landmark]
+                        bx=x[0];by=y[0]
+                        return [(v-bx) for v in x]+[(v-by) for v in y]
+
+                    land2=norm(result.multi_hand_landmarks[0]) + \
+                          norm(result.multi_hand_landmarks[1])
+
+                    if isl_model:
+                        probs = isl_model.predict_proba([land2])[0]
+                        max_index = probs.argmax()
+                        isl_pred = isl_model.classes_[max_index]
+                        confidence = round(probs[max_index]*100,2)
+
+            if isl_pred:
+                prediction=isl_pred
+            elif asl_pred:
+                prediction=asl_pred
+
+        if prediction:
+
+            if prediction==last_prediction and time.time()-last_spoken>1.2:
+
+                latest_prediction=prediction
+                latest_confidence=confidence   # NEW
+
+                if word_mode:
+                    if prediction!=last_added_letter:
+                        word_buffer.append(prediction)
+                        last_added_letter=prediction
+
+                last_spoken=time.time()
+
+            else:
+                last_prediction=prediction
+
+        cv2.putText(frame,f"Mode: {current_inference_mode.upper()}",(10,70),
+        cv2.FONT_HERSHEY_SIMPLEX,0.8,(0,255,255),2)
+
+        cv2.putText(frame,f"{latest_prediction} ({latest_confidence}%)",(10,40),
+        cv2.FONT_HERSHEY_SIMPLEX,1,(0,255,0),2)
+
+        _,buffer=cv2.imencode(".jpg",frame)
+
+        yield(b'--frame\r\nContent-Type:image/jpeg\r\n\r\n'+buffer.tobytes()+b'\r\n')
+
+
+# =====================
+# ROUTES
+# =====================
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/video")
+def video():
+    return Response(gen_frames(),
+    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/get_prediction")
+def get_prediction():
+    return jsonify({
+        "prediction":latest_prediction,
+        "confidence":latest_confidence
+    })
+
+@app.route("/set_mode", methods=["POST"])
+def set_mode():
+    global current_inference_mode
+    mode = request.get_json().get("mode", "auto")
+    if mode in ["yolo", "mediapipe", "auto"]:
+        current_inference_mode = mode
+    return jsonify({"mode": current_inference_mode})
+
+@app.route("/toggle_speak", methods=["POST"])
+def toggle_speak():
+    global speak_enabled
+    speak_enabled=request.get_json().get("enabled",True)
+    return jsonify({"speak_enabled":speak_enabled})
+
+
+# =====================
+# WORD MODE
+# =====================
+@app.route("/start_word_mode",methods=["POST"])
+def start_word_mode():
+    global word_mode,word_buffer,last_added_letter
+    word_mode=True
+    word_buffer=[]
+    last_added_letter=None
+    return jsonify({"msg":"started"})
+
+
+@app.route("/finish_word",methods=["POST"])
+def finish_word():
+    global word_mode,last_added_letter
+    word_mode=False
+    final="".join(word_buffer)
+    last_added_letter=None
+
+    if speak_enabled and final:
+        subprocess.Popen([
+        "python","-c",
+        f"import pyttsx3; e=pyttsx3.init(); e.say('{final}'); e.runAndWait()"
+        ])
+
+    return jsonify({"word":final})
+
+
+@app.route("/delete_letter",methods=["POST"])
+def delete_letter():
+    global word_buffer
+    if word_buffer:
+        word_buffer.pop()
+    return jsonify({"word":"".join(word_buffer)})
+
+
+# =====================
+# NEW FEATURES
+# =====================
+
+@app.route("/add_word", methods=["POST"])
+def add_word():
+    global sentence_buffer, word_buffer
+
+    word="".join(word_buffer)
+
+    if word:
+        sentence_buffer.append(word)
+
+    word_buffer=[]
+
+    return jsonify({"sentence":" ".join(sentence_buffer)})
+
+
+@app.route("/speak_sentence", methods=["POST"])
+def speak_sentence():
+    global sentence_buffer
+
+    sentence=" ".join(sentence_buffer)
+
+    if sentence:
+        subprocess.Popen([
+            "python","-c",
+            f"import pyttsx3; e=pyttsx3.init(); e.say('{sentence}'); e.runAndWait()"
+        ])
+
+    return jsonify({"sentence":sentence})
+
+
+@app.route("/get_history")
+def get_history():
+    return jsonify({"history":conversation_history})
+
+
+@app.route("/get_accuracy")
+def get_accuracy():
+    return jsonify({"accuracy":round(current_accuracy*100,2)})
+
+
+@app.route("/set_language", methods=["POST"])
+def set_language():
+    global language
+    language=request.json.get("lang","en")
+    return jsonify({"lang":language})
+
+
+# =====================
+# TRAIN MODEL
+# =====================
+@app.route("/train_model", methods=["POST"])
+def train_model():
+    global asl_model,current_accuracy
+    asl_model,current_accuracy=load_and_train_model()
+    return jsonify({"accuracy":round(current_accuracy*100,2)})
+
+
+# =====================
+# START COLLECTION
+# =====================
+@app.route("/start_collection", methods=["POST"])
+def start_collection():
+
+    global camera
+    label=request.json.get("label","").strip()
+    if not label:
+        return jsonify({"error":"Label required"})
+
+    filename="gesture_data.csv"
+    file_exists=os.path.isfile(filename)
+
+    samples=0
+
+    while samples<100:
+
+        if camera is None or not camera.isOpened():
+            camera=cv2.VideoCapture(0)
+
+        ret,frame=camera.read()
+        if not ret:
+            continue
+
+        frame=cv2.flip(frame,1)
+
+        rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
+        result=hands.process(rgb)
+
+        if result.multi_hand_landmarks:
+
+            h=result.multi_hand_landmarks[0]
+
+            x=[lm.x for lm in h.landmark]
+            y=[lm.y for lm in h.landmark]
+
+            bx=x[0];by=y[0]
+
+            land=[(v-bx) for v in x]+[(v-by) for v in y]
+
+            if len(land)==42:
+
+                with open(filename,"a",newline="") as f:
+
+                    w=csv.writer(f)
+
+                    if not file_exists:
+                        w.writerow(["label"]+[f"f{i}" for i in range(42)])
+                        file_exists=True
+
+                    w.writerow([label]+land)
+
+                    samples+=1
+
+        cv2.waitKey(10)
+
+    return jsonify({"samples":samples})
+
+
+# =====================
+if __name__=="__main__":
+    print("🚀 Running http://localhost:5000")
+    app.run(host="0.0.0.0",port=5000,debug=True)
