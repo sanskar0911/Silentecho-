@@ -312,7 +312,7 @@ Total Dataset
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/your-username/SilentEcho.git
+git clone https://github.com/sanskar0911/Silentecho-.git
 cd SilentEcho
 
 # 2. (Optional but recommended) Create a virtual environment
