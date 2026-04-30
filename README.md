@@ -339,36 +339,38 @@ http://127.0.0.1:5000
 ```
 Silentecho/
 │
-├── app.py                          # 🚀 Main Flask server — routes, webcam stream,
-│                                   #    auth endpoints, YOLO + MediaPipe pipeline
+├── app.py                              # 🚀 Main Flask server — routes, webcam stream,
+│                                       #    auth endpoints, YOLO + MediaPipe pipeline
 │
-├── gesture_recognition.py          # 🧠 Core ML module — trains Random Forest on CSV,
-│                                   #    normalizes 42 landmarks, predicts gesture label
+├── gesture_recognition.py              # 🧠 Core ML module — trains Random Forest on CSV,
+│                                       #    normalizes 42 landmarks, predicts gesture label
 │
-├── gesture_data_collector.py       # 📷 ASL dataset builder — captures webcam frames,
-│                                   #    extracts MediaPipe landmarks → gesture_data.csv
-│                                   #    (5000 samples/label)
+├── gesture_data_collector.py           # 📷 ASL dataset builder — captures webcam frames,
+│                                       #    extracts MediaPipe landmarks → gesture_data.csv
+│                                       #    (5000 samples/label)
 │
-├── isl_gesture_data_collector.py   # 🤚 ISL dataset builder — same pipeline tuned for
-│                                   #    two-hand Indian Sign Language gestures
-│                                   #    (500 samples/label)
+├── isl_gesture_data_collector.py       # 🤚 ISL dataset builder — same pipeline tuned for
+│                                       #    two-hand Indian Sign Language gestures
 │
-├── best.pt                         # ⚡ YOLO model weights (trained, ~3.1 MB)
-│                                   #    used for advanced gesture image classification
+├── templates/
+│   └── index.html                      # 🖥️ Full frontend UI — webcam feed, sentence
 │
-├── isl_gesture_data.csv            # 📊 ISL landmark dataset (~21 MB)
-│                                   #    Format: label, x0–x20, y0–y20 (42 features)
+├── static/                             # 🎨 (optional) CSS, JS, images, icons
 │
-├── pretrained_word.csv             # 📊 ASL/pretrained word dataset (~3.6 MB)
-│                                   #    Used for Random Forest training
+├── best.pt                             # ⚡ YOLO model weights (trained, ~3.1 MB)
+│                                       #    used for advanced gesture classification
 │
-├── index.html                      # 🖥️ Full frontend UI — webcam feed, sentence builder,
-│                                   #    login/register, TTS controls (~48 KB)
+├── isl_gesture_data.csv                # 📊 ISL landmark dataset (~21 MB)
 │
-├── users.db                        # 🔐 SQLite database — stores hashed user credentials
-│                                   #    (email + bcrypt password hash)
+├── pretrained_word.csv                 # 📊 ASL/pretrained word dataset (~3.6 MB)
+│                                       #    used for Random Forest training
 │
-└── README.md                       # 📄 Project documentation
+├── users.db                            # 🔐 SQLite database — stores hashed user
+│                                       #    credentials (email + bcrypt password hash)
+│
+├── .gitignore                          # 🚫 Excludes .csv, .pt, .db from GitHub upload
+│
+└── README.md                           # 📄 Project documentation
 ```
 
 ---
